@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -20,8 +21,10 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------
 # Model names change over time. Override with the GEMINI_MODEL secret / env var
 # (or the sidebar box) if this default is retired.
-DEFAULT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODELS = ["gemini-3.8-flash"]
+DEFAULT_MODEL = "gemini-3.6-flash"
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
+RETRIES_PER_MODEL = 3  # attempts on a busy model before switching
+RETRY_DELAY_SECONDS = 2  # doubles each retry: 2s, 4s
 
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model
@@ -297,8 +300,35 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
-    """Call Gemini (trying fallback models if needed) and return a normalized result."""
+TRANSIENT_MARKERS = (
+    "503", "unavailable", "429", "resource_exhausted", "500", "504",
+    "overloaded", "high demand", "deadline", "timed out", "timeout",
+    "connection",
+)
+
+
+def is_transient_error(exc: Exception) -> bool:
+    """True for temporary problems (overload, rate limit, network) worth retrying."""
+    code = getattr(exc, "code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in TRANSIENT_MARKERS)
+
+
+def analyze_resume(
+    api_key: str,
+    model: str,
+    resume_text: str,
+    job_description: str,
+    sleep=time.sleep,
+) -> dict:
+    """Call Gemini and return a normalized result.
+
+    Busy/overloaded models (503, 429...) are retried with a growing delay, then the
+    next fallback model is tried. Permanent errors (bad model name, bad key) skip
+    straight to the next model.
+    """
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(resume_text, job_description)
     config = types.GenerateContentConfig(
@@ -309,12 +339,30 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
 
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
+    any_transient = False
     for name in candidates:
-        try:
-            response = client.models.generate_content(model=name, contents=prompt, config=config)
-            return normalize_result(parse_json_response(response.text))
-        except Exception as exc:  # try the next model, keep the last error
-            last_error = exc
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=name, contents=prompt, config=config)
+                return normalize_result(parse_json_response(response.text))
+            except ValueError as exc:  # unparsable answer - one more try may fix it
+                last_error = exc
+                if attempt < RETRIES_PER_MODEL - 1:
+                    continue
+                break
+            except Exception as exc:
+                last_error = exc
+                if not is_transient_error(exc):
+                    break  # permanent for this model: try the next one
+                any_transient = True
+                if attempt < RETRIES_PER_MODEL - 1:
+                    sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+
+    if any_transient:
+        raise RuntimeError(
+            "Google's Gemini servers are overloaded right now (temporary). "
+            "Please wait a minute and click Analyze again."
+        )
     raise RuntimeError(f"Gemini request failed: {last_error}")
 
 
