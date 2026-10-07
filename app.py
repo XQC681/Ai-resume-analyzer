@@ -21,8 +21,9 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------
 # Model names change over time. Override with the GEMINI_MODEL secret / env var
 # (or the sidebar box) if this default is retired.
-DEFAULT_MODEL = "gemini-3.6-flash"
-FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
+DEFAULT_MODEL = "gemini-3.5-flash"
+# Tried in order when the chosen model is busy. Lite models are cheaper and usually less crowded.
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"]
 RETRIES_PER_MODEL = 3  # attempts on a busy model before switching
 RETRY_DELAY_SECONDS = 2  # doubles each retry: 2s, 4s
 
@@ -316,6 +317,11 @@ def is_transient_error(exc: Exception) -> bool:
     return any(marker in text for marker in TRANSIENT_MARKERS)
 
 
+def is_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return getattr(exc, "code", None) == 429 or "429" in text or "resource_exhausted" in text or "quota" in text
+
+
 def analyze_resume(
     api_key: str,
     model: str,
@@ -340,6 +346,7 @@ def analyze_resume(
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
     any_transient = False
+    quota_hit = False
     for name in candidates:
         for attempt in range(RETRIES_PER_MODEL):
             try:
@@ -355,13 +362,21 @@ def analyze_resume(
                 if not is_transient_error(exc):
                     break  # permanent for this model: try the next one
                 any_transient = True
+                if is_quota_error(exc):
+                    quota_hit = True
                 if attempt < RETRIES_PER_MODEL - 1:
                     sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
 
+    tried = ", ".join(candidates)
+    if any_transient and quota_hit:
+        raise RuntimeError(
+            "Gemini rate limit / quota reached (common on the free tier). "
+            f"Wait a minute and try again. Models tried: {tried}."
+        )
     if any_transient:
         raise RuntimeError(
             "Google's Gemini servers are overloaded right now (temporary). "
-            "Please wait a minute and click Analyze again."
+            f"Wait a minute and click Analyze again. Models tried: {tried}."
         )
     raise RuntimeError(f"Gemini request failed: {last_error}")
 
